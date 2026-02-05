@@ -1,0 +1,433 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+from torch.autograd import grad
+import matplotlib.pyplot as plt
+import os
+torch.manual_seed(42)
+np.random.seed(42)
+
+Re = 1
+nu = 1.0 / Re
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pi = torch.tensor(np.pi, device=device, dtype=torch.float32)
+
+x_range = (0.0, pi.item())
+y_range = (0.0, pi.item())
+t_range = (0.0, 1.0)
+
+N_e = 6400
+N_i = 1600
+N_b = 1600
+
+num_iterations = 15001
+lr = 0.001
+alpha = 0.5
+beta = 0.5
+hidden_layers = 6
+hidden_dim = 128
+
+
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
+        self.input_layer = nn.Linear(3, hidden_dim)
+        self.hidden = nn.Sequential(
+            *[nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+              for _ in range(hidden_layers)]
+        )
+        self.output_layer = nn.Linear(hidden_dim, 3)
+
+    def forward(self, x, y, t):
+        inputs = torch.cat([x, y, t], dim=1)
+        x = self.input_layer(inputs)
+        x = self.hidden(x)
+        u1, u2, P = self.output_layer(x).chunk(3, dim=1)
+        return u1, u2, P
+
+def sample_interior_points():
+    n = int(np.sqrt(N_e))
+    x = torch.linspace(x_range[0], x_range[1], n, device=device)
+    y = torch.linspace(y_range[0], y_range[1], n, device=device)
+    x_grid, y_grid = torch.meshgrid(x, y, indexing="ij")
+    
+    x_flat = x_grid.reshape(-1, 1)
+    y_flat = y_grid.reshape(-1, 1)
+    
+    t_flat = torch.rand(n*n, 1, device=device) * (t_range[1]-t_range[0]) + t_range[0]
+    
+    return x_flat.requires_grad_(True), y_flat.requires_grad_(True), t_flat.requires_grad_(True)
+
+def sample_initial_points():
+    n = int(np.sqrt(N_i))
+    x = torch.linspace(x_range[0], x_range[1], n, device=device)
+    y = torch.linspace(y_range[0], y_range[1], n, device=device)
+    x_grid, y_grid = torch.meshgrid(x, y, indexing="ij")
+    
+    x_flat = x_grid.reshape(-1, 1)
+    y_flat = y_grid.reshape(-1, 1)
+    t_flat = torch.zeros(n*n, 1, device=device)
+    
+    return x_flat.requires_grad_(True), y_flat.requires_grad_(True), t_flat.requires_grad_(True)
+
+def sample_boundary_points():
+    n_per_side = N_b // 4
+    
+    t_fixed1 = torch.rand(1, device=device)
+    t_random1 = torch.rand(n_per_side, 1, device=device) * (t_range[1]-t_range[0]) + t_range[0]
+    x1 = torch.zeros(n_per_side, 1, device=device)
+    y1 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1, 1)
+    t1_fixed = torch.full_like(y1, t_fixed1.item())
+    
+    t_fixed2 = torch.rand(1, device=device)
+    t_random2 = torch.rand(n_per_side, 1, device=device) * (t_range[1]-t_range[0]) + t_range[0]
+    x2 = pi*torch.ones(n_per_side, 1, device=device)
+    y2 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1, 1)
+    t2_fixed = torch.full_like(y2, t_fixed2.item())
+    
+    t_fixed3 = torch.rand(1, device=device)
+    t_random3 = torch.rand(n_per_side, 1, device=device) * (t_range[1]-t_range[0]) + t_range[0]
+    x3 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1, 1)
+    y3 = torch.zeros(n_per_side, 1, device=device)
+    t3_fixed = torch.full_like(x3, t_fixed3.item())
+    
+    t_fixed4 = torch.rand(1, device=device)
+    t_random4 = torch.rand(n_per_side, 1, device=device) * (t_range[1]-t_range[0]) + t_range[0]
+    x4 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1, 1)
+    y4 = pi*torch.ones(n_per_side, 1, device=device)
+    t4_fixed = torch.full_like(x4, t_fixed4.item())
+
+    edge1 = (x1.requires_grad_(True), y1.requires_grad_(True),
+             t1_fixed.requires_grad_(True), t_random1.requires_grad_(True))
+    edge2 = (x2.requires_grad_(True), y2.requires_grad_(True),
+             t2_fixed.requires_grad_(True), t_random2.requires_grad_(True))
+    edge3 = (x3.requires_grad_(True), y3.requires_grad_(True),
+             t3_fixed.requires_grad_(True), t_random3.requires_grad_(True))
+    edge4 = (x4.requires_grad_(True), y4.requires_grad_(True),
+             t4_fixed.requires_grad_(True), t_random4.requires_grad_(True))
+    
+    return [edge1, edge2, edge3, edge4]
+
+def compute_t_deriv(v, t):
+    return grad(v.sum(), t, create_graph=True)[0]
+
+def get_analytical_solution(x, y, t):
+    exp_term = torch.exp(-2 * t)
+    u1_star = -torch.cos(x) * torch.sin(y) * exp_term
+    u2_star = torch.sin(x) * torch.cos(y) * exp_term
+    P_star = -0.25 * (torch.cos(2*x) + torch.cos(2*y)) * torch.exp(-4*t)
+    return u1_star, u2_star, P_star
+
+def get_analytical_t_deriv(x, y, t):
+    exp_term = torch.exp(-2 * t)
+    exp_term_4 = torch.exp(-4 * t)
+    
+    u1_star_t = 2 * torch.cos(x) * torch.sin(y) * exp_term
+    u2_star_t = -2 * torch.sin(x) * torch.cos(y) * exp_term
+    P_star_t = (torch.cos(2*x) + torch.cos(2*y)) * exp_term_4
+    
+    return u1_star_t, u2_star_t, P_star_t
+
+def compute_ns_residuals(u1, u2, P, x, y, t):
+    u1_x = grad(u1.sum(), x, create_graph=True)[0]
+    u1_y = grad(u1.sum(), y, create_graph=True)[0]
+    u1_t = grad(u1.sum(), t, create_graph=True)[0]
+    
+    u2_x = grad(u2.sum(), x, create_graph=True)[0]
+    u2_y = grad(u2.sum(), y, create_graph=True)[0]
+    u2_t = grad(u2.sum(), t, create_graph=True)[0]
+    
+    P_x = grad(P.sum(), x, create_graph=True)[0]
+    P_y = grad(P.sum(), y, create_graph=True)[0]
+    
+    u1_xx = grad(u1_x.sum(), x, create_graph=True)[0]
+    u1_yy = grad(u1_y.sum(), y, create_graph=True)[0]
+    
+    u2_xx = grad(u2_x.sum(), x, create_graph=True)[0]
+    u2_yy = grad(u2_y.sum(), y, create_graph=True)[0]
+    
+    res_div = u1_x + u2_y
+    res_div_t = grad(res_div.sum(), t, create_graph=True)[0]
+    
+    res_x = u1_t + u1*u1_x + u2*u1_y + P_x - nu*(u1_xx + u1_yy)
+    res_y = u2_t + u1*u2_x + u2*u2_y + P_y - nu*(u2_xx + u2_yy)
+    
+    return res_x, res_y, res_div, res_div_t
+
+def compute_h1_2_squared(v_pred, v_star, edge):
+    e = v_pred - v_star
+    x, y, t_fixed, _ = edge
+    n = e.shape[0]
+    
+    if n < 2:
+        return torch.tensor(1e-8, device=device)
+    
+    eps = 1e-4
+    k = 20
+    
+    x_mat = x.expand(n, n)
+    y_mat = y.expand(n, n)
+    dist_mat = torch.sqrt((x_mat - x_mat.T)**2 + (y_mat - y_mat.T)**2)
+    dist_mat = torch.clamp(dist_mat, min=eps)
+    
+    e_mat = e.expand(n, n)
+    diff_e_sq = (e_mat - e_mat.T)**2
+    
+    term_mat = diff_e_sq / (dist_mat ** 2)
+    
+    mask = torch.eye(n, device=device, dtype=torch.bool)
+    term_mat = term_mat.masked_fill(mask, 0.0)
+    
+    dist_flat = dist_mat.reshape(n, -1)
+    _, idx = torch.sort(dist_flat, dim=1)
+    idx_k = idx[:, 1:k+1]
+    
+    term_k = torch.gather(term_mat, dim=1, index=idx_k)
+    semi_part = term_k.mean()
+    
+    return semi_part
+
+compute_h1_2_squared_for_deriv = compute_h1_2_squared
+
+def compute_total_loss(model):
+    x_e, y_e, t_e = sample_interior_points()
+    u1_e, u2_e, P_e = model(x_e, y_e, t_e)
+    _ , _ ,p_star = get_analytical_solution(x_e,y_e,t_e)
+    res_x, res_y, res_div, res_div_t = compute_ns_residuals(u1_e, u2_e, P_e, x_e, y_e, t_e)
+
+    loss_eq = (res_x**2).mean() + (res_y**2).mean() + (res_div**2).mean() + (res_div_t**2).mean()
+    
+    x_i, y_i, t_i = sample_initial_points()
+    u1_i, u2_i, P_i = model(x_i, y_i, t_i)
+    u1_i_star, u2_i_star, P_i_star = get_analytical_solution(x_i, y_i, t_i)
+    loss_init_u = ((u1_i - u1_i_star)**2).mean() + ((u2_i - u2_i_star)** 2).mean()
+    loss_init_p = ((P_i - P_i_star)**2).mean()
+    loss_init = loss_init_u + loss_init_p
+    
+    edges = sample_boundary_points()
+    loss_bnd = 0.0
+    
+    semi_weight = 1.0
+    l2_weight = 1.0
+    deriv_semi_weight = 1.0
+    deriv_l2_weight = 1.0
+    
+    for edge in edges:
+        x_b, y_b, t_fixed, t_random = edge
+        
+        u1_b_semi, u2_b_semi, _ = model(x_b, y_b, t_fixed)
+        u1_b_star_semi, u2_b_star_semi, _ = get_analytical_solution(x_b, y_b, t_fixed)
+        loss_u1_semi = compute_h1_2_squared(u1_b_semi, u1_b_star_semi, edge)
+        loss_u2_semi = compute_h1_2_squared(u2_b_semi, u2_b_star_semi, edge)
+        
+        u1_b_l2, u2_b_l2, P_b_l2 = model(x_b, y_b, t_random)
+        u1_b_star_l2, u2_b_star_l2, P_b_star_l2 = get_analytical_solution(x_b, y_b, t_random)
+        loss_u1_l2 = ((u1_b_l2 - u1_b_star_l2)**2).mean()
+        loss_u2_l2 = ((u2_b_l2 - u2_b_star_l2)**2).mean()
+        loss_p_l2 = ((P_b_l2 - P_b_star_l2)**2).mean()
+        
+        u1_b_semi_t = compute_t_deriv(u1_b_semi, t_fixed)
+        u2_b_semi_t = compute_t_deriv(u2_b_semi, t_fixed)
+        u1_b_star_semi_t, u2_b_star_semi_t, _ = get_analytical_t_deriv(x_b, y_b, t_fixed)
+        loss_u1_deriv_semi = compute_h1_2_squared_for_deriv(u1_b_semi_t, u1_b_star_semi_t, edge)
+        loss_u2_deriv_semi = compute_h1_2_squared_for_deriv(u2_b_semi_t, u2_b_star_semi_t, edge)
+        
+        u1_b_l2_t = compute_t_deriv(u1_b_l2, t_random)
+        u2_b_l2_t = compute_t_deriv(u2_b_l2, t_random)
+        P_b_l2_t = compute_t_deriv(P_b_l2, t_random)
+        u1_b_star_l2_t, u2_b_star_l2_t, P_b_star_l2_t = get_analytical_t_deriv(x_b, y_b, t_random)
+        loss_u1_deriv_l2 = ((u1_b_l2_t - u1_b_star_l2_t)**2).mean()
+        loss_u2_deriv_l2 = ((u2_b_l2_t - u2_b_star_l2_t)**2).mean()
+        loss_p_deriv_l2 = ((P_b_l2_t - P_b_star_l2_t)**2).mean()
+        
+        loss_edge = (
+            semi_weight * (loss_u1_semi + loss_u2_semi) +
+            l2_weight * (loss_u1_l2 + loss_u2_l2 + loss_p_l2) +
+            deriv_semi_weight * (loss_u1_deriv_semi + loss_u2_deriv_semi) +
+            deriv_l2_weight * (loss_u1_deriv_l2 + loss_u2_deriv_l2 + loss_p_deriv_l2)
+        )
+        loss_bnd += loss_edge
+    
+    loss_bnd /= len(edges)
+    
+    total_loss = loss_eq + alpha * loss_init + beta * loss_bnd
+    return total_loss, loss_eq, loss_init, loss_bnd
+
+def visualize_results(model, loss_history=None, t_val=0.5, save_path=None, show_plot=False):
+    model.eval()
+    with torch.no_grad():
+        n_grid = 100
+        x_val = torch.linspace(x_range[0], x_range[1], n_grid, device=device).unsqueeze(1)
+        y_val = torch.linspace(y_range[0], y_range[1], n_grid, device=device).unsqueeze(1)
+        t_val = torch.tensor([t_val], device=device).unsqueeze(1)
+        
+        x_grid, y_grid, t_grid = torch.meshgrid(
+            x_val.squeeze(), y_val.squeeze(), t_val.squeeze(), indexing="ij"
+        )
+        x_flat = x_grid.unsqueeze(-1).reshape(-1, 1)
+        y_flat = y_grid.unsqueeze(-1).reshape(-1, 1)
+        t_flat = t_grid.unsqueeze(-1).reshape(-1, 1)
+        
+        u1_pred, u2_pred, P_pred = model(x_flat, y_flat, t_flat)
+        u1_star, u2_star, P_star = get_analytical_solution(x_flat, y_flat, t_flat)
+        
+        u1_pred_grid = u1_pred.reshape(n_grid, n_grid).cpu().numpy()
+        u1_star_grid = u1_star.reshape(n_grid, n_grid).cpu().numpy()
+        u1_err_grid = np.abs(u1_pred_grid - u1_star_grid)
+        
+        u2_pred_grid = u2_pred.reshape(n_grid, n_grid).cpu().numpy()
+        u2_star_grid = u2_star.reshape(n_grid, n_grid).cpu().numpy()
+        u2_err_grid = np.abs(u2_pred_grid - u2_star_grid)
+        
+        P_pred_grid = P_pred.reshape(n_grid, n_grid).cpu().numpy()
+        P_star_grid = P_star.reshape(n_grid, n_grid).cpu().numpy()
+        P_err_grid = np.abs(P_pred_grid - P_star_grid)
+        
+        x_plot = x_grid.cpu().numpy()[:, :, 0]
+        y_plot = y_grid.cpu().numpy()[:, :, 0]
+        
+        fig, axes = plt.subplots(2, 3, figsize=(16, 12))
+
+        if save_path:
+            iter_num = save_path.split("_")[-1].split(".")[0]
+            fig.suptitle(f'(Case 1) Tr-PINNs Results at t={t_val.item()}  | Iteration {iter_num}',
+                         fontsize=16, y=0.98)
+        else:
+            fig.suptitle(f'(Case 1) Tr-PINNs Results at t={t_val.item()} ',
+                         fontsize=16, y=0.98)
+        
+        cmap_pred = 'viridis'
+        cmap_err = 'viridis'
+        umin,umax=0,0.0039
+        
+        plt.subplots_adjust(
+            wspace=0.1,
+            hspace=0.3,
+            top=0.9,
+            bottom=0.3,
+            left=0.1,
+            right=0.9 )
+        im1 = axes[0, 0].contourf(x_plot, y_plot, u1_pred_grid, cmap=cmap_pred, levels=50)
+        axes[0, 0].set_title('(a) u₁ (Tr-PINNs Prediction)', fontsize=12)
+        axes[0, 0].set_xlabel('x')
+        axes[0, 0].set_ylabel('y')
+        axes[0, 0].set_aspect('equal')
+        plt.colorbar(im1, ax=axes[0, 0], shrink=0.6)
+        
+        im2 = axes[0, 1].contourf(x_plot, y_plot, u1_star_grid, cmap=cmap_pred, levels=50)
+        axes[0, 1].set_title('(c) u₁ (Analytical Solution)', fontsize=12)
+        axes[0, 1].set_aspect('equal')
+        plt.colorbar(im2, ax=axes[0, 1], shrink=0.6)
+        
+        im3 = axes[0, 2].contourf(x_plot, y_plot, u1_err_grid, cmap=cmap_err, vmin=umin,vmax=umax,levels=50)
+        axes[0, 2].set_title(f'(e) u₁ Absolute Error (max={u1_err_grid.max():.4f})', fontsize=12)
+        plt.colorbar(im3, ax=axes[0, 2], shrink=0.6)
+        
+        im4 = axes[1, 0].contourf(x_plot, y_plot, u2_pred_grid, cmap=cmap_pred, levels=50)
+        axes[1, 0].set_title('(b) u₂ (Tr-PINNs Prediction)', fontsize=12)
+        axes[1, 0].set_aspect('equal')
+        plt.colorbar(im4, ax=axes[1, 0], shrink=0.6)
+        
+        im5 = axes[1, 1].contourf(x_plot, y_plot, u2_star_grid, cmap=cmap_pred, levels=50)
+        axes[1, 1].set_title('(d) u₂ (Analytical Solution)', fontsize=12)
+        axes[1, 1].set_aspect('equal')
+        plt.colorbar(im5, ax=axes[1, 1], shrink=0.6)
+        
+        im6 = axes[1, 2].contourf(x_plot, y_plot, u2_err_grid, cmap=cmap_err,vmin=umin,vmax=umax, levels=50)
+        axes[1, 2].set_title(f'(f) u₂ Absolute Error (max={u2_err_grid.max():.4f})', fontsize=12)
+        axes[1, 2].set_aspect('equal')
+        plt.colorbar(im6, ax=axes[1, 2], shrink=0.6)
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close(fig)
+
+def train_pinn():
+    os.makedirs("pinn_results", exist_ok=True)
+    
+    model = PINN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=1000,
+        min_lr=1e-7
+    )
+    loss_history = []
+
+    model.train()
+    for iter in range(num_iterations + 1):
+        if iter == 10001 and not isinstance(optimizer, optim.LBFGS):
+            print("切换为LBFGS优化器...")
+            optimizer = optim.LBFGS(model.parameters(), lr=0.1, max_iter=50, tolerance_grad=1e-7)
+        
+        def closure():
+            optimizer.zero_grad()
+            total_loss, loss_eq, loss_init, loss_bnd = compute_total_loss(model)
+            total_loss.backward()
+            return total_loss
+        
+        optimizer.step(closure)
+        
+        total_loss, loss_eq, loss_init, loss_bnd = compute_total_loss(model)
+        scheduler.step(total_loss)
+
+        if iter % 1000 == 0:
+            loss_history.append({
+                "iter": iter,
+                "total_loss": total_loss.item(),
+                "loss_eq": loss_eq.item(),
+                "loss_init": loss_init.item(),
+                "loss_bnd": loss_bnd.item()
+            })
+            print(f"迭代 {iter:5d} | 总损失: {total_loss.item():.6f} | "
+                  f"方程残差: {loss_eq.item():.6f} | 初始损失: {loss_init.item():.6f} | "
+                  f"边界损失: {loss_bnd.item():.6f}")
+            
+            save_path = f"pinn_results/results999_iter_H1_2_{iter}.png"
+            visualize_results(model, loss_history=loss_history, t_val=0.5, save_path=save_path, show_plot=False)
+
+    model.eval()
+    with torch.no_grad():
+        x_val = torch.linspace(x_range[0], x_range[1], 100, device=device).unsqueeze(1)
+        y_val = torch.linspace(y_range[0], y_range[1], 100, device=device).unsqueeze(1)
+        t_val = torch.tensor([0.5], device=device).unsqueeze(1)
+        
+        x_grid, y_grid, t_grid = torch.meshgrid(x_val.squeeze(), y_val.squeeze(), t_val.squeeze(), indexing="ij")
+        x_flat = x_grid.unsqueeze(-1).reshape(-1, 1)
+        y_flat = y_grid.unsqueeze(-1).reshape(-1, 1)
+        t_flat = t_grid.unsqueeze(-1).reshape(-1, 1)
+        
+        u1_pred, u2_pred, _ = model(x_flat, y_flat, t_flat)
+        u1_star, u2_star, _ = get_analytical_solution(x_flat, y_flat, t_flat)
+        
+        l2_u1 = torch.sqrt(((u1_pred - u1_star)**2).mean())
+        l2_u2 = torch.sqrt(((u2_pred - u2_star)** 2).mean())
+        
+        print("\n=== 验证结果（t=0.5）===")
+        print(f"u1的L2误差: {l2_u1.item():.6f}")
+        print(f"u2的L2误差: {l2_u2.item():.6f}")
+
+    visualize_results(model, loss_history=loss_history, t_val=0.5, show_plot=True)
+    
+    return model, loss_history
+
+if __name__ == "__main__":
+    trained_model, loss_history = train_pinn()
+    iter_list = [h["iter"] for h in loss_history]
+    total_loss_list = [h["total_loss"] for h in loss_history]
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(iter_list, total_loss_list, label="Total Loss", color="#1f77b4")
+    plt.xlabel("Iteration", fontsize=12)
+    plt.ylabel("Loss (Log Scale)", fontsize=12)
+    plt.title("(Case 1) Tr-PINN Training Loss History ", fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.show()
